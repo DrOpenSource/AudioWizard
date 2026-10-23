@@ -1,0 +1,159 @@
+{
+  "name": "audiowizard",
+  "displayName": "AudioWizard",
+  "description": "Neural text-to-speech reader for documentation, long context files, and AI agent responses in Antigravity, Cursor, and VS Code.",
+  "version": "0.1.0",
+  "publisher": "dr-opensource",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DrOpenSource/AudioWizard.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Accessibility",
+    "Other",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "text to speech",
+    "tts",
+    "read aloud",
+    "audio",
+    "agent voice",
+    "accessibility",
+    "markdown"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "audiowizard.readDocument",
+        "title": "AudioWizard: Read Document",
+        "category": "AudioWizard",
+        "icon": "$(unmute)"
+      },
+      {
+        "command": "audiowizard.readSelection",
+        "title": "AudioWizard: Read Selection",
+        "category": "AudioWizard"
+      },
+      {
+        "command": "audiowizard.readClipboard",
+        "title": "AudioWizard: Read Clipboard / Agent Response",
+        "category": "AudioWizard",
+        "icon": "$(clippy)"
+      },
+      {
+        "command": "audiowizard.togglePlayPause",
+        "title": "AudioWizard: Toggle Play / Pause",
+        "category": "AudioWizard"
+      },
+      {
+        "command": "audiowizard.stop",
+        "title": "AudioWizard: Stop Audio",
+        "category": "AudioWizard"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "audiowizard.readDocument",
+          "when": "resourceLangId =~ /^(markdown|plaintext|prompt|instructions|chatagent|chatmode|skill)$/",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "audiowizard.readSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@9"
+        },
+        {
+          "command": "audiowizard.readDocument",
+          "when": "editorLangId =~ /^(markdown|plaintext|prompt|instructions|chatagent|chatmode|skill)$/ && !editorHasSelection",
+          "group": "navigation@9"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "audiowizard.readDocument"
+        },
+        {
+          "command": "audiowizard.readSelection"
+        },
+        {
+          "command": "audiowizard.readClipboard"
+        },
+        {
+          "command": "audiowizard.togglePlayPause"
+        },
+        {
+          "command": "audiowizard.stop"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "audiowizard.readDocument",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "audiowizard.readSelection",
+        "key": "ctrl+alt+s",
+        "mac": "cmd+alt+s",
+        "when": "editorHasSelection && editorTextFocus"
+      },
+      {
+        "command": "audiowizard.readClipboard",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c"
+      },
+      {
+        "command": "audiowizard.togglePlayPause",
+        "key": "ctrl+alt+space",
+        "mac": "cmd+alt+space"
+      }
+    ],
+    "configuration": {
+      "title": "AudioWizard",
+      "properties": {
+        "audiowizard.speed": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.5,
+          "maximum": 2.5,
+          "description": "Playback speed multiplier (0.5x to 2.5x)"
+        },
+        "audiowizard.voice": {
+          "type": "string",
+          "default": "en-US-JennyNeural",
+          "description": "Default neural voice (e.g. en-US-JennyNeural, en-US-GuyNeural, en-IN-NeerjaNeural)"
+        },
+        "audiowizard.skipCodeBlocks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Skip raw multi-line code blocks and announce them gracefully."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./ --noEmit",
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3"
+  }
+}
