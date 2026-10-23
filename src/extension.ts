@@ -11,6 +11,7 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar.command = "audiowizard.togglePlayPause";
   statusBar.show();
   context.subscriptions.push(statusBar);
+  player.setStatusBarItem(statusBar);
 
   // 1. Read Active Document
   const readDocCmd = vscode.commands.registerCommand('audiowizard.readDocument', () => {
@@ -44,7 +45,7 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.window.showInformationMessage('AudioWizard: Clipboard is empty. Copy text from chat first.');
       return;
     }
-    player.playText(text, 'Clipboard / Agent Response');
+    player.playText(text, 'Agent Response / Clipboard');
   });
 
   // 4. Toggle Play/Pause
@@ -61,5 +62,5 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  // Clean up if needed
+  // Cleanup
 }

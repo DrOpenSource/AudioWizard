@@ -1,14 +1,18 @@
 import * as vscode from 'vscode';
 import { cleanTextForSpeech } from '../parser/cleaner';
+import { TTSSynthesizer } from '../tts/synthesizer';
 
 export class AudioPlayerManager {
   private static instance: AudioPlayerManager | null = null;
   private panel: vscode.WebviewPanel | null = null;
-  private isPlaying: boolean = false;
+  private synthesizer: TTSSynthesizer;
+  private statusBarItem: vscode.StatusBarItem | null = null;
   private currentTitle: string = 'AudioWizard Player';
   private currentText: string = '';
 
-  private constructor(private readonly context: vscode.ExtensionContext) {}
+  private constructor(private readonly context: vscode.ExtensionContext) {
+    this.synthesizer = new TTSSynthesizer();
+  }
 
   public static getInstance(context: vscode.ExtensionContext): AudioPlayerManager {
     if (!AudioPlayerManager.instance) {
@@ -17,7 +21,11 @@ export class AudioPlayerManager {
     return AudioPlayerManager.instance;
   }
 
-  public playText(text: string, title: string = 'Audio'): void {
+  public setStatusBarItem(item: vscode.StatusBarItem) {
+    this.statusBarItem = item;
+  }
+
+  public async playText(text: string, title: string = 'Audio'): Promise<void> {
     const cleaned = cleanTextForSpeech(text);
     if (!cleaned.trim()) {
       vscode.window.showInformationMessage('AudioWizard: No readable text found.');
@@ -26,18 +34,46 @@ export class AudioPlayerManager {
 
     this.currentTitle = title;
     this.currentText = cleaned;
-
     this.ensurePanel();
+
+    if (this.statusBarItem) {
+      this.statusBarItem.text = '$(sync~spin) AudioWizard: Synthesizing...';
+    }
+
     this.panel?.webview.postMessage({
-      command: 'play',
+      command: 'prepare',
       text: this.currentText,
       title: this.currentTitle
     });
+
+    try {
+      // Synthesize using Edge Neural TTS
+      const audioDataUrl = await this.synthesizer.synthesizeText(this.currentText);
+      this.panel?.webview.postMessage({
+        command: 'playAudio',
+        audioSrc: audioDataUrl,
+        title: this.currentTitle,
+        text: this.currentText
+      });
+      if (this.statusBarItem) {
+        this.statusBarItem.text = '$(unmute) AudioWizard: Playing';
+      }
+    } catch (err: any) {
+      console.warn('Edge TTS failed, falling back to Webview Speech API:', err);
+      this.panel?.webview.postMessage({
+        command: 'fallbackSpeech',
+        text: this.currentText,
+        title: this.currentTitle
+      });
+      if (this.statusBarItem) {
+        this.statusBarItem.text = '$(unmute) AudioWizard: Playing';
+      }
+    }
   }
 
   public togglePlayPause(): void {
     if (!this.panel) {
-      vscode.window.showInformationMessage('AudioWizard: No active audio session. Use Read Document or Read Selection to start.');
+      vscode.window.showInformationMessage('AudioWizard: No active audio session. Highlight text or copy to clipboard first.');
       return;
     }
     this.panel.webview.postMessage({ command: 'toggle' });
@@ -46,6 +82,9 @@ export class AudioPlayerManager {
   public stop(): void {
     if (this.panel) {
       this.panel.webview.postMessage({ command: 'stop' });
+    }
+    if (this.statusBarItem) {
+      this.statusBarItem.text = '$(unmute) AudioWizard';
     }
   }
 
@@ -66,13 +105,25 @@ export class AudioPlayerManager {
 
     this.panel.webview.onDidReceiveMessage((message) => {
       if (message.type === 'status') {
-        this.isPlaying = message.playing;
+        if (this.statusBarItem) {
+          if (message.playing) {
+            this.statusBarItem.text = '$(unmute) AudioWizard: Playing';
+          } else if (message.paused) {
+            this.statusBarItem.text = '$(mute) AudioWizard: Paused';
+          } else {
+            this.statusBarItem.text = '$(unmute) AudioWizard';
+          }
+        }
+      } else if (message.type === 'changeVoice') {
+        this.synthesizer.setVoice(message.voice);
       }
     });
 
     this.panel.onDidDispose(() => {
       this.panel = null;
-      this.isPlaying = false;
+      if (this.statusBarItem) {
+        this.statusBarItem.text = '$(unmute) AudioWizard';
+      }
     });
   }
 
@@ -87,7 +138,7 @@ export class AudioPlayerManager {
       font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
       background-color: var(--vscode-editor-background);
       color: var(--vscode-editor-foreground);
-      padding: 18px;
+      padding: 16px;
       line-height: 1.5;
     }
     .header {
@@ -96,32 +147,34 @@ export class AudioPlayerManager {
       justify-content: space-between;
       border-bottom: 1px solid var(--vscode-widget-border, #333);
       padding-bottom: 12px;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
-    h2 { margin: 0; font-size: 1.1rem; display: flex; align-items: center; gap: 8px; }
+    h2 { margin: 0; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; }
     .controls {
       display: flex;
       align-items: center;
       gap: 10px;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
       flex-wrap: wrap;
     }
     button {
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
       border: none;
-      padding: 8px 14px;
+      padding: 7px 14px;
       border-radius: 4px;
       cursor: pointer;
       font-weight: 600;
+      font-size: 0.9rem;
     }
     button:hover { background: var(--vscode-button-hoverBackground); }
-    .speed-select, .voice-select {
+    select {
       background: var(--vscode-dropdown-background);
       color: var(--vscode-dropdown-foreground);
       border: 1px solid var(--vscode-dropdown-border);
-      padding: 6px 10px;
+      padding: 5px 8px;
       border-radius: 4px;
+      font-size: 0.85rem;
     }
     .text-box {
       background: var(--vscode-editorWidget-background, rgba(255,255,255,0.03));
@@ -132,9 +185,10 @@ export class AudioPlayerManager {
       overflow-y: auto;
       font-size: 0.95rem;
       white-space: pre-wrap;
+      word-break: break-word;
     }
     .status-badge {
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       padding: 3px 8px;
       border-radius: 12px;
       background: var(--vscode-badge-background);
@@ -149,11 +203,11 @@ export class AudioPlayerManager {
   </div>
 
   <div class="controls">
-    <button id="btnPlayPause">Pause</button>
+    <button id="btnPlayPause">Play</button>
     <button id="btnStop">Stop</button>
     
     <label>Speed:
-      <select id="selSpeed" class="speed-select">
+      <select id="selSpeed">
         <option value="0.75">0.75x</option>
         <option value="1.0" selected>1.0x</option>
         <option value="1.25">1.25x</option>
@@ -164,118 +218,104 @@ export class AudioPlayerManager {
     </label>
 
     <label>Voice:
-      <select id="selVoice" class="voice-select"></select>
+      <select id="selVoice">
+        <option value="en-US-JennyNeural" selected>Jenny (US Neural)</option>
+        <option value="en-US-GuyNeural">Guy (US Neural)</option>
+        <option value="en-US-AriaNeural">Aria (US Neural)</option>
+        <option value="en-IN-NeerjaNeural">Neerja (India Neural)</option>
+        <option value="en-GB-SoniaNeural">Sonia (UK Neural)</option>
+      </select>
     </label>
   </div>
 
-  <div id="content" class="text-box">Ready to read. Use Ctrl+Alt+R on documents or Ctrl+Alt+C for clipboard.</div>
+  <div id="content" class="text-box">Ready. Use Ctrl+Alt+C to read copied chat response, or Ctrl+Alt+R on open files.</div>
+
+  <audio id="audioEl" style="display:none;"></audio>
 
   <script>
     const vscode = acquireVsCodeApi();
-    let synth = window.speechSynthesis;
-    let voices = [];
-    let currentUtterance = null;
-    let currentText = '';
-    let isPaused = false;
+    const audioEl = document.getElementById('audioEl');
+    const btnPlayPause = document.getElementById('btnPlayPause');
+    const btnStop = document.getElementById('btnStop');
+    const selSpeed = document.getElementById('selSpeed');
+    const selVoice = document.getElementById('selVoice');
+    const badge = document.getElementById('badge');
+    const titleEl = document.getElementById('title');
+    const contentEl = document.getElementById('content');
 
-    function populateVoices() {
-      voices = synth.getVoices().filter(v => v.lang.startsWith('en'));
-      if (voices.length === 0) voices = synth.getVoices();
-      const sel = document.getElementById('selVoice');
-      sel.innerHTML = '';
-      voices.forEach((v, i) => {
-        const opt = document.createElement('option');
-        opt.value = i;
-        opt.textContent = v.name + ' (' + v.lang + ')';
-        if (v.name.includes('Natural') || v.name.includes('Neural') || v.default) {
-          opt.selected = true;
-        }
-        sel.appendChild(opt);
-      });
+    function setBadge(text, playing, paused) {
+      badge.textContent = text;
+      vscode.postMessage({ type: 'status', playing: playing, paused: paused });
     }
 
-    if (speechSynthesis.onvoiceschanged !== undefined) {
-      speechSynthesis.onvoiceschanged = populateVoices;
-    }
-    populateVoices();
+    audioEl.addEventListener('play', () => {
+      setBadge('Playing', true, false);
+      btnPlayPause.textContent = 'Pause';
+    });
 
-    function setBadge(text, playing) {
-      const b = document.getElementById('badge');
-      b.textContent = text;
-      vscode.postMessage({ type: 'status', playing: playing });
-    }
-
-    function speak(text, title) {
-      synth.cancel();
-      isPaused = false;
-      currentText = text;
-      document.getElementById('title').textContent = title || 'AudioWizard Player';
-      document.getElementById('content').textContent = text;
-      document.getElementById('btnPlayPause').textContent = 'Pause';
-
-      if (!text.trim()) return;
-
-      currentUtterance = new SpeechSynthesisUtterance(text);
-      const selVoice = document.getElementById('selVoice');
-      if (voices[selVoice.value]) {
-        currentUtterance.voice = voices[selVoice.value];
+    audioEl.addEventListener('pause', () => {
+      if (!audioEl.ended) {
+        setBadge('Paused', false, true);
+        btnPlayPause.textContent = 'Resume';
       }
-      currentUtterance.rate = parseFloat(document.getElementById('selSpeed').value) || 1.0;
+    });
 
-      currentUtterance.onstart = () => setBadge('Playing', true);
-      currentUtterance.onend = () => {
-        setBadge('Finished', false);
-        document.getElementById('btnPlayPause').textContent = 'Replay';
-      };
-      currentUtterance.onerror = () => setBadge('Error', false);
+    audioEl.addEventListener('ended', () => {
+      setBadge('Finished', false, false);
+      btnPlayPause.textContent = 'Replay';
+    });
 
-      synth.speak(currentUtterance);
-    }
+    audioEl.addEventListener('error', (e) => {
+      console.error('Audio error:', e);
+      setBadge('Error', false, false);
+    });
 
-    document.getElementById('btnPlayPause').addEventListener('click', () => {
-      if (!currentText) return;
-      if (synth.speaking && !synth.paused) {
-        synth.pause();
-        isPaused = true;
-        document.getElementById('btnPlayPause').textContent = 'Resume';
-        setBadge('Paused', false);
-      } else if (synth.paused) {
-        synth.resume();
-        isPaused = false;
-        document.getElementById('btnPlayPause').textContent = 'Pause';
-        setBadge('Playing', true);
+    btnPlayPause.addEventListener('click', () => {
+      if (!audioEl.src) return;
+      if (audioEl.paused) {
+        audioEl.play().catch(console.error);
       } else {
-        speak(currentText, document.getElementById('title').textContent);
+        audioEl.pause();
       }
     });
 
-    document.getElementById('btnStop').addEventListener('click', () => {
-      synth.cancel();
-      isPaused = false;
-      setBadge('Stopped', false);
-      document.getElementById('btnPlayPause').textContent = 'Play';
+    btnStop.addEventListener('click', () => {
+      audioEl.pause();
+      audioEl.currentTime = 0;
+      setBadge('Stopped', false, false);
+      btnPlayPause.textContent = 'Play';
     });
 
-    document.getElementById('selSpeed').addEventListener('change', () => {
-      if (synth.speaking && !synth.paused) {
-        speak(currentText, document.getElementById('title').textContent);
-      }
+    selSpeed.addEventListener('change', () => {
+      audioEl.playbackRate = parseFloat(selSpeed.value) || 1.0;
     });
 
-    document.getElementById('selVoice').addEventListener('change', () => {
-      if (synth.speaking && !synth.paused) {
-        speak(currentText, document.getElementById('title').textContent);
-      }
+    selVoice.addEventListener('change', () => {
+      vscode.postMessage({ type: 'changeVoice', voice: selVoice.value });
     });
 
-    window.addEventListener('message', event => {
+    window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (msg.command === 'play') {
-        speak(msg.text, msg.title);
+      if (msg.command === 'prepare') {
+        titleEl.textContent = msg.title || 'AudioWizard Player';
+        contentEl.textContent = msg.text || '';
+        setBadge('Synthesizing...', false, false);
+      } else if (msg.command === 'playAudio') {
+        titleEl.textContent = msg.title || 'AudioWizard Player';
+        contentEl.textContent = msg.text || '';
+        audioEl.src = msg.audioSrc;
+        audioEl.playbackRate = parseFloat(selSpeed.value) || 1.0;
+        audioEl.play().catch(console.error);
       } else if (msg.command === 'toggle') {
-        document.getElementById('btnPlayPause').click();
+        btnPlayPause.click();
       } else if (msg.command === 'stop') {
-        document.getElementById('btnStop').click();
+        btnStop.click();
+      } else if (msg.command === 'fallbackSpeech') {
+        titleEl.textContent = msg.title || 'AudioWizard Player';
+        contentEl.textContent = msg.text || '';
+        const utt = new SpeechSynthesisUtterance(msg.text);
+        utt.rate = parseFloat(selSpeed.value) || 1.0;
+        window.speechSynthesis.speak(utt);
       }
     });
   </script>

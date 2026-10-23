@@ -127,7 +127,7 @@
       "properties": {
         "audiowizard.speed": {
           "type": "number",
-          "default": 1.0,
+          "default": 1,
           "minimum": 0.5,
           "maximum": 2.5,
           "description": "Playback speed multiplier (0.5x to 2.5x)"
@@ -155,5 +155,9 @@
     "@types/vscode": "^1.90.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.7.3"
-  }
+  },
+  "dependencies": {
+    "msedge-tts": "^2.1.0"
+  },
+  "icon": "assets/icon.png"
 }
