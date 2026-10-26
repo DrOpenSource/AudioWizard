@@ -1,7 +1,7 @@
 {
   "name": "audiowizard",
   "displayName": "AudioWizard",
-  "description": "Neural text-to-speech reader for documentation, long context files, and AI agent responses in Antigravity, Cursor, and VS Code.",
+  "description": "Listen instead of read. Neural text-to-speech for Markdown docs, long specs and AI agent replies, with a native-feeling player, sentence highlighting and Skim mode.",
   "version": "0.1.0",
   "publisher": "dr-opensource",
   "license": "MIT",
@@ -21,10 +21,14 @@
     "text to speech",
     "tts",
     "read aloud",
+    "listen",
     "audio",
-    "agent voice",
+    "agent",
+    "claude",
+    "copilot",
     "accessibility",
-    "markdown"
+    "markdown",
+    "speech"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -34,29 +38,39 @@
     "commands": [
       {
         "command": "audiowizard.readDocument",
-        "title": "AudioWizard: Read Document",
+        "title": "Read File Aloud",
         "category": "AudioWizard",
         "icon": "$(unmute)"
       },
       {
+        "command": "audiowizard.skimDocument",
+        "title": "Skim File (Headings and First Sentences)",
+        "category": "AudioWizard"
+      },
+      {
+        "command": "audiowizard.read",
+        "title": "Read Selection or Clipboard",
+        "category": "AudioWizard"
+      },
+      {
         "command": "audiowizard.readSelection",
-        "title": "AudioWizard: Read Selection",
+        "title": "Read Selection",
         "category": "AudioWizard"
       },
       {
         "command": "audiowizard.readClipboard",
-        "title": "AudioWizard: Read Clipboard / Agent Response",
+        "title": "Read Clipboard",
         "category": "AudioWizard",
         "icon": "$(clippy)"
       },
       {
         "command": "audiowizard.togglePlayPause",
-        "title": "AudioWizard: Toggle Play / Pause",
+        "title": "Play / Pause",
         "category": "AudioWizard"
       },
       {
         "command": "audiowizard.stop",
-        "title": "AudioWizard: Stop Audio",
+        "title": "Stop",
         "category": "AudioWizard"
       }
     ],
@@ -82,19 +96,8 @@
       ],
       "commandPalette": [
         {
-          "command": "audiowizard.readDocument"
-        },
-        {
-          "command": "audiowizard.readSelection"
-        },
-        {
-          "command": "audiowizard.readClipboard"
-        },
-        {
-          "command": "audiowizard.togglePlayPause"
-        },
-        {
-          "command": "audiowizard.stop"
+          "command": "audiowizard.stop",
+          "when": "audiowizard.active"
         }
       ]
     },
@@ -106,58 +109,105 @@
         "when": "editorTextFocus"
       },
       {
-        "command": "audiowizard.readSelection",
-        "key": "ctrl+alt+s",
-        "mac": "cmd+alt+s",
-        "when": "editorHasSelection && editorTextFocus"
+        "command": "audiowizard.read",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c",
+        "when": "editorTextFocus",
+        "args": {
+          "copyFirst": false
+        }
       },
       {
-        "command": "audiowizard.readClipboard",
+        "command": "audiowizard.read",
         "key": "ctrl+alt+c",
-        "mac": "cmd+alt+c"
+        "mac": "cmd+alt+c",
+        "when": "!editorTextFocus && !terminalFocus",
+        "args": {
+          "copyFirst": true
+        }
       },
       {
         "command": "audiowizard.togglePlayPause",
         "key": "ctrl+alt+space",
-        "mac": "cmd+alt+space"
+        "mac": "cmd+alt+p"
+      },
+      {
+        "command": "audiowizard.stop",
+        "key": "ctrl+alt+x",
+        "mac": "cmd+alt+x",
+        "when": "audiowizard.active"
       }
     ],
     "configuration": {
       "title": "AudioWizard",
       "properties": {
+        "audiowizard.engine": {
+          "type": "string",
+          "enum": [
+            "neural",
+            "system"
+          ],
+          "default": "neural",
+          "enumDescriptions": [
+            "Microsoft Edge neural voices. Natural sounding; the text being read is sent to Microsoft's speech service.",
+            "Your operating system's built-in voices. Fully offline; nothing leaves your machine."
+          ],
+          "description": "Which speech engine reads your text."
+        },
+        "audiowizard.voice": {
+          "type": "string",
+          "default": "en-US-JennyNeural",
+          "description": "Neural voice name, e.g. en-US-JennyNeural, en-US-AndrewNeural, en-GB-SoniaNeural, en-IN-NeerjaNeural. Also changeable from the player."
+        },
         "audiowizard.speed": {
           "type": "number",
           "default": 1,
           "minimum": 0.5,
           "maximum": 2.5,
-          "description": "Playback speed multiplier (0.5x to 2.5x)"
-        },
-        "audiowizard.voice": {
-          "type": "string",
-          "default": "en-US-JennyNeural",
-          "description": "Default neural voice (e.g. en-US-JennyNeural, en-US-GuyNeural, en-IN-NeerjaNeural)"
+          "description": "Playback speed (0.5× to 2.5×). Also changeable from the player."
         },
         "audiowizard.skipCodeBlocks": {
           "type": "boolean",
           "default": true,
-          "description": "Skip raw multi-line code blocks and announce them gracefully."
+          "description": "Announce fenced code blocks (\"Code block, 12 lines, skipped\") instead of reading code aloud."
         }
       }
+    },
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "audiowizard",
+          "title": "AudioWizard",
+          "icon": "assets/speaker.svg"
+        }
+      ]
+    },
+    "views": {
+      "audiowizard": [
+        {
+          "type": "webview",
+          "id": "audiowizard.player",
+          "name": "Player"
+        }
+      ]
     }
   },
   "scripts": {
     "compile": "tsc -p ./ --noEmit",
     "build": "node esbuild.config.mjs",
-    "watch": "node esbuild.config.mjs --watch"
+    "watch": "node esbuild.config.mjs --watch",
+    "test": "vitest run",
+    "package": "npm run compile && npm test && npm run build && npx @vscode/vsce package"
   },
   "devDependencies": {
     "@types/node": "^22.13.0",
     "@types/vscode": "^1.90.0",
     "esbuild": "^0.25.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
   },
   "dependencies": {
-    "msedge-tts": "^2.1.0"
+    "msedge-tts": "^2.1.1"
   },
   "icon": "assets/icon.png"
 }

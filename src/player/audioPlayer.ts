@@ -1,325 +1,244 @@
 import * as vscode from 'vscode';
 import { cleanTextForSpeech } from '../parser/cleaner';
-import { TTSSynthesizer } from '../tts/synthesizer';
+import { Chunk, splitIntoChunks } from '../parser/chunker';
+import { skimMarkdown } from '../parser/skim';
+import { SynthesisCancelled, TTSSynthesizer } from '../tts/synthesizer';
+import { getPlayerHtml } from './webview';
 
-export class AudioPlayerManager {
-  private static instance: AudioPlayerManager | null = null;
-  private panel: vscode.WebviewPanel | null = null;
-  private synthesizer: TTSSynthesizer;
-  private statusBarItem: vscode.StatusBarItem | null = null;
-  private currentTitle: string = 'AudioWizard Player';
-  private currentText: string = '';
+export type ReadMode = 'full' | 'skim';
+export type Origin = 'document' | 'selection' | 'clipboard';
+type PlayerState = 'idle' | 'loading' | 'playing' | 'paused';
 
-  private constructor(private readonly context: vscode.ExtensionContext) {
-    this.synthesizer = new TTSSynthesizer();
+interface Source {
+  raw: string;
+  title: string;
+  origin: Origin;
+}
+
+const PREFETCH = 2;
+
+/**
+ * Owns the player view and the read-aloud session. The webview plays one chunk
+ * at a time and asks for the next; this side synthesizes ahead of it.
+ */
+export class AudioPlayerManager implements vscode.WebviewViewProvider, vscode.Disposable {
+  public static readonly viewId = 'audiowizard.player';
+
+  private view: vscode.WebviewView | null = null;
+  private ready = false;
+  private outbox: unknown[] = [];
+  private readonly synthesizer = new TTSSynthesizer();
+  private readonly statusBar: vscode.StatusBarItem;
+  private readonly disposables: vscode.Disposable[] = [];
+
+  private source: Source | null = null;
+  private mode: ReadMode = 'full';
+  private chunks: Chunk[] = [];
+  private session = 0;
+  private abort = new AbortController();
+  private cache = new Map<number, Promise<string>>();
+
+  constructor(private readonly context: vscode.ExtensionContext) {
+    this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    this.statusBar.command = 'audiowizard.togglePlayPause';
+    this.setState('idle');
+    this.statusBar.show();
+
+    this.disposables.push(
+      this.statusBar,
+      vscode.window.registerWebviewViewProvider(AudioPlayerManager.viewId, this, {
+        webviewOptions: { retainContextWhenHidden: true },
+      }),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('audiowizard')) this.post({ command: 'settings', ...this.settings() });
+      })
+    );
   }
 
-  public static getInstance(context: vscode.ExtensionContext): AudioPlayerManager {
-    if (!AudioPlayerManager.instance) {
-      AudioPlayerManager.instance = new AudioPlayerManager(context);
-    }
-    return AudioPlayerManager.instance;
+  public resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    this.ready = false;
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'assets')],
+    };
+    view.webview.html = getPlayerHtml(view.webview);
+    view.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
+    view.onDidDispose(() => {
+      this.view = null;
+      this.ready = false;
+      this.cancelSynthesis();
+      this.setState('idle');
+    });
   }
 
-  public setStatusBarItem(item: vscode.StatusBarItem) {
-    this.statusBarItem = item;
-  }
-
-  public async playText(text: string, title: string = 'Audio'): Promise<void> {
-    const cleaned = cleanTextForSpeech(text);
-    if (!cleaned.trim()) {
+  public async play(raw: string, title: string, origin: Origin, mode: ReadMode = this.mode): Promise<void> {
+    this.source = { raw, title, origin };
+    this.mode = mode;
+    if (!this.load(0)) {
       vscode.window.showInformationMessage('AudioWizard: No readable text found.');
       return;
     }
-
-    this.currentTitle = title;
-    this.currentText = cleaned;
-    this.ensurePanel();
-
-    if (this.statusBarItem) {
-      this.statusBarItem.text = '$(sync~spin) AudioWizard: Synthesizing...';
-    }
-
-    this.panel?.webview.postMessage({
-      command: 'prepare',
-      text: this.currentText,
-      title: this.currentTitle
-    });
-
-    try {
-      // Synthesize using Edge Neural TTS
-      const audioDataUrl = await this.synthesizer.synthesizeText(this.currentText);
-      this.panel?.webview.postMessage({
-        command: 'playAudio',
-        audioSrc: audioDataUrl,
-        title: this.currentTitle,
-        text: this.currentText
-      });
-      if (this.statusBarItem) {
-        this.statusBarItem.text = '$(unmute) AudioWizard: Playing';
-      }
-    } catch (err: any) {
-      console.warn('Edge TTS failed, falling back to Webview Speech API:', err);
-      this.panel?.webview.postMessage({
-        command: 'fallbackSpeech',
-        text: this.currentText,
-        title: this.currentTitle
-      });
-      if (this.statusBarItem) {
-        this.statusBarItem.text = '$(unmute) AudioWizard: Playing';
-      }
-    }
+    await this.reveal(origin !== 'clipboard');
   }
 
   public togglePlayPause(): void {
-    if (!this.panel) {
-      vscode.window.showInformationMessage('AudioWizard: No active audio session. Highlight text or copy to clipboard first.');
+    if (!this.source) {
+      vscode.window.showInformationMessage('AudioWizard: Nothing to play yet. Select text or copy a reply, then press Ctrl+Alt+C.');
       return;
     }
-    this.panel.webview.postMessage({ command: 'toggle' });
+    this.post({ command: 'toggle' });
   }
 
   public stop(): void {
-    if (this.panel) {
-      this.panel.webview.postMessage({ command: 'stop' });
-    }
-    if (this.statusBarItem) {
-      this.statusBarItem.text = '$(unmute) AudioWizard';
+    this.cancelSynthesis();
+    this.post({ command: 'stop' });
+    this.setState('idle');
+  }
+
+  public dispose(): void {
+    this.stop();
+    this.synthesizer.dispose();
+    this.disposables.forEach((d) => d.dispose());
+  }
+
+  /** Builds the chunk list for the current source and mode and sends it to the player. */
+  private load(startIndex: number): boolean {
+    if (!this.source) return false;
+    const { skipCodeBlocks } = this.settings();
+    const text = this.mode === 'skim' ? skimMarkdown(this.source.raw) : this.source.raw;
+    const chunks = splitIntoChunks(cleanTextForSpeech(text, { skipCodeBlocks }));
+    if (!chunks.length) return false;
+
+    this.cancelSynthesis();
+    this.chunks = chunks;
+    this.session++;
+    this.setState('loading');
+    this.post({
+      command: 'load',
+      session: this.session,
+      title: this.source.title,
+      origin: this.source.origin,
+      mode: this.mode,
+      chunks,
+      startIndex: Math.min(startIndex, chunks.length - 1),
+      ...this.settings(),
+    });
+    return true;
+  }
+
+  private onMessage(msg: any): void {
+    switch (msg?.type) {
+      case 'ready':
+        this.ready = true;
+        this.outbox.splice(0).forEach((m) => this.view?.webview.postMessage(m));
+        this.post({ command: 'settings', ...this.settings() });
+        break;
+      case 'need':
+        if (msg.session === this.session) this.deliver(msg.index);
+        break;
+      case 'state':
+        this.setState(msg.state);
+        break;
+      case 'setVoice':
+        this.cancelSynthesis();
+        void this.updateSetting('voice', msg.voice).then(() => {
+          if (typeof msg.index === 'number') this.load(msg.index);
+        });
+        break;
+      case 'setSpeed':
+        void this.updateSetting('speed', msg.speed);
+        break;
+      case 'setMode':
+        if (msg.mode === 'full' || msg.mode === 'skim') {
+          this.mode = msg.mode;
+          this.load(0);
+        }
+        break;
+      case 'stop':
+        this.cancelSynthesis();
+        break;
     }
   }
 
-  private ensurePanel(): void {
-    if (this.panel) {
-      this.panel.reveal(vscode.ViewColumn.Beside, true);
+  private async deliver(index: number): Promise<void> {
+    const session = this.session;
+    for (const key of this.cache.keys()) {
+      if (key < index - 1) this.cache.delete(key);
+    }
+    for (let i = index + 1; i <= index + PREFETCH && i < this.chunks.length; i++) {
+      this.synthesizeAhead(i).catch(() => undefined);
+    }
+    try {
+      const src = await this.synthesizeAhead(index);
+      if (session === this.session) this.post({ command: 'audio', session, index, src });
+    } catch (err) {
+      if (err instanceof SynthesisCancelled || session !== this.session) return;
+      console.warn('AudioWizard: Edge TTS failed, using the system voice for this sentence.', err);
+      this.cache.delete(index);
+      this.post({ command: 'audioFailed', session, index });
+    }
+  }
+
+  private synthesizeAhead(index: number): Promise<string> {
+    let pending = this.cache.get(index);
+    if (!pending) {
+      pending = this.synthesizer.synthesize(this.chunks[index].text, this.settings().voice, this.abort.signal);
+      this.cache.set(index, pending);
+    }
+    return pending;
+  }
+
+  private cancelSynthesis(): void {
+    this.abort.abort();
+    this.abort = new AbortController();
+    this.cache.clear();
+  }
+
+  private async reveal(restoreEditorFocus: boolean): Promise<void> {
+    if (this.view) {
+      this.view.show(true);
       return;
     }
-
-    this.panel = vscode.window.createWebviewPanel(
-      'audiowizard.player',
-      'AudioWizard Player',
-      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-      { enableScripts: true, retainContextWhenHidden: true }
-    );
-
-    this.panel.webview.html = this.getHtml();
-
-    this.panel.webview.onDidReceiveMessage((message) => {
-      if (message.type === 'status') {
-        if (this.statusBarItem) {
-          if (message.playing) {
-            this.statusBarItem.text = '$(unmute) AudioWizard: Playing';
-          } else if (message.paused) {
-            this.statusBarItem.text = '$(mute) AudioWizard: Paused';
-          } else {
-            this.statusBarItem.text = '$(unmute) AudioWizard';
-          }
-        }
-      } else if (message.type === 'changeVoice') {
-        this.synthesizer.setVoice(message.voice);
-      }
-    });
-
-    this.panel.onDidDispose(() => {
-      this.panel = null;
-      if (this.statusBarItem) {
-        this.statusBarItem.text = '$(unmute) AudioWizard';
-      }
-    });
+    await vscode.commands.executeCommand(`${AudioPlayerManager.viewId}.focus`);
+    if (restoreEditorFocus && vscode.window.activeTextEditor) {
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+    }
   }
 
-  private getHtml(): string {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>AudioWizard</title>
-  <style>
-    body {
-      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
-      background-color: var(--vscode-editor-background);
-      color: var(--vscode-editor-foreground);
-      padding: 16px;
-      line-height: 1.5;
+  private post(message: unknown): void {
+    if (this.view && this.ready) {
+      this.view.webview.postMessage(message);
+    } else if ((message as { command?: string }).command === 'load') {
+      // Only the latest load matters once the view comes up
+      this.outbox = [message];
     }
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid var(--vscode-widget-border, #333);
-      padding-bottom: 12px;
-      margin-bottom: 14px;
-    }
-    h2 { margin: 0; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; }
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 14px;
-      flex-wrap: wrap;
-    }
-    button {
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border: none;
-      padding: 7px 14px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 0.9rem;
-    }
-    button:hover { background: var(--vscode-button-hoverBackground); }
-    select {
-      background: var(--vscode-dropdown-background);
-      color: var(--vscode-dropdown-foreground);
-      border: 1px solid var(--vscode-dropdown-border);
-      padding: 5px 8px;
-      border-radius: 4px;
-      font-size: 0.85rem;
-    }
-    .text-box {
-      background: var(--vscode-editorWidget-background, rgba(255,255,255,0.03));
-      border: 1px solid var(--vscode-widget-border, #444);
-      padding: 14px;
-      border-radius: 6px;
-      max-height: 380px;
-      overflow-y: auto;
-      font-size: 0.95rem;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .status-badge {
-      font-size: 0.78rem;
-      padding: 3px 8px;
-      border-radius: 12px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-    }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h2 id="title">AudioWizard Player</h2>
-    <span id="badge" class="status-badge">Idle</span>
-  </div>
+  }
 
-  <div class="controls">
-    <button id="btnPlayPause">Play</button>
-    <button id="btnStop">Stop</button>
-    
-    <label>Speed:
-      <select id="selSpeed">
-        <option value="0.75">0.75x</option>
-        <option value="1.0" selected>1.0x</option>
-        <option value="1.25">1.25x</option>
-        <option value="1.5">1.5x</option>
-        <option value="1.75">1.75x</option>
-        <option value="2.0">2.0x</option>
-      </select>
-    </label>
+  private settings() {
+    const config = vscode.workspace.getConfiguration('audiowizard');
+    return {
+      voice: config.get<string>('voice', 'en-US-JennyNeural'),
+      speed: config.get<number>('speed', 1),
+      engine: config.get<'neural' | 'system'>('engine', 'neural'),
+      skipCodeBlocks: config.get<boolean>('skipCodeBlocks', true),
+    };
+  }
 
-    <label>Voice:
-      <select id="selVoice">
-        <option value="en-US-JennyNeural" selected>Jenny (US Neural)</option>
-        <option value="en-US-GuyNeural">Guy (US Neural)</option>
-        <option value="en-US-AriaNeural">Aria (US Neural)</option>
-        <option value="en-IN-NeerjaNeural">Neerja (India Neural)</option>
-        <option value="en-GB-SoniaNeural">Sonia (UK Neural)</option>
-      </select>
-    </label>
-  </div>
+  private async updateSetting(key: string, value: unknown): Promise<void> {
+    await vscode.workspace.getConfiguration('audiowizard').update(key, value, vscode.ConfigurationTarget.Global);
+  }
 
-  <div id="content" class="text-box">Ready. Use Ctrl+Alt+C to read copied chat response, or Ctrl+Alt+R on open files.</div>
-
-  <audio id="audioEl" style="display:none;"></audio>
-
-  <script>
-    const vscode = acquireVsCodeApi();
-    const audioEl = document.getElementById('audioEl');
-    const btnPlayPause = document.getElementById('btnPlayPause');
-    const btnStop = document.getElementById('btnStop');
-    const selSpeed = document.getElementById('selSpeed');
-    const selVoice = document.getElementById('selVoice');
-    const badge = document.getElementById('badge');
-    const titleEl = document.getElementById('title');
-    const contentEl = document.getElementById('content');
-
-    function setBadge(text, playing, paused) {
-      badge.textContent = text;
-      vscode.postMessage({ type: 'status', playing: playing, paused: paused });
-    }
-
-    audioEl.addEventListener('play', () => {
-      setBadge('Playing', true, false);
-      btnPlayPause.textContent = 'Pause';
-    });
-
-    audioEl.addEventListener('pause', () => {
-      if (!audioEl.ended) {
-        setBadge('Paused', false, true);
-        btnPlayPause.textContent = 'Resume';
-      }
-    });
-
-    audioEl.addEventListener('ended', () => {
-      setBadge('Finished', false, false);
-      btnPlayPause.textContent = 'Replay';
-    });
-
-    audioEl.addEventListener('error', (e) => {
-      console.error('Audio error:', e);
-      setBadge('Error', false, false);
-    });
-
-    btnPlayPause.addEventListener('click', () => {
-      if (!audioEl.src) return;
-      if (audioEl.paused) {
-        audioEl.play().catch(console.error);
-      } else {
-        audioEl.pause();
-      }
-    });
-
-    btnStop.addEventListener('click', () => {
-      audioEl.pause();
-      audioEl.currentTime = 0;
-      setBadge('Stopped', false, false);
-      btnPlayPause.textContent = 'Play';
-    });
-
-    selSpeed.addEventListener('change', () => {
-      audioEl.playbackRate = parseFloat(selSpeed.value) || 1.0;
-    });
-
-    selVoice.addEventListener('change', () => {
-      vscode.postMessage({ type: 'changeVoice', voice: selVoice.value });
-    });
-
-    window.addEventListener('message', (event) => {
-      const msg = event.data;
-      if (msg.command === 'prepare') {
-        titleEl.textContent = msg.title || 'AudioWizard Player';
-        contentEl.textContent = msg.text || '';
-        setBadge('Synthesizing...', false, false);
-      } else if (msg.command === 'playAudio') {
-        titleEl.textContent = msg.title || 'AudioWizard Player';
-        contentEl.textContent = msg.text || '';
-        audioEl.src = msg.audioSrc;
-        audioEl.playbackRate = parseFloat(selSpeed.value) || 1.0;
-        audioEl.play().catch(console.error);
-      } else if (msg.command === 'toggle') {
-        btnPlayPause.click();
-      } else if (msg.command === 'stop') {
-        btnStop.click();
-      } else if (msg.command === 'fallbackSpeech') {
-        titleEl.textContent = msg.title || 'AudioWizard Player';
-        contentEl.textContent = msg.text || '';
-        const utt = new SpeechSynthesisUtterance(msg.text);
-        utt.rate = parseFloat(selSpeed.value) || 1.0;
-        window.speechSynthesis.speak(utt);
-      }
-    });
-  </script>
-</body>
-</html>`;
+  private setState(state: PlayerState): void {
+    const labels: Record<PlayerState, [string, string]> = {
+      idle: ['$(unmute) AudioWizard', 'AudioWizard: read selection or clipboard (Ctrl+Alt+C)'],
+      loading: ['$(loading~spin) AudioWizard', 'AudioWizard: preparing audio'],
+      playing: ['$(debug-pause) AudioWizard', 'AudioWizard: playing. Click to pause (Ctrl+Alt+Space)'],
+      paused: ['$(play) AudioWizard', 'AudioWizard: paused. Click to resume (Ctrl+Alt+Space)'],
+    };
+    const [text, tooltip] = labels[state] ?? labels.idle;
+    this.statusBar.text = text;
+    this.statusBar.tooltip = tooltip;
+    void vscode.commands.executeCommand('setContext', 'audiowizard.active', state !== 'idle');
   }
 }

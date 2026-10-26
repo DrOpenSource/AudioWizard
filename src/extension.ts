@@ -1,66 +1,79 @@
 import * as vscode from 'vscode';
-import { AudioPlayerManager } from './player/audioPlayer';
+import { AudioPlayerManager, ReadMode } from './player/audioPlayer';
+
+function fileName(doc: vscode.TextDocument): string {
+  return doc.fileName.split(/[\\/]/).pop() || 'Document';
+}
+
+/**
+ * Copies whatever is selected in the focused view (a chat panel, a webview),
+ * then reads the clipboard. Falls back to the existing clipboard when nothing was selected.
+ */
+async function copyFocusedSelection(): Promise<void> {
+  try {
+    await vscode.commands.executeCommand('editor.action.clipboardCopyAction');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  } catch {
+    // Nothing focusable to copy from; use the clipboard as it is
+  }
+}
 
 export function activate(context: vscode.ExtensionContext) {
-  const player = AudioPlayerManager.getInstance(context);
+  const player = new AudioPlayerManager(context);
+  context.subscriptions.push(player);
 
-  // Status Bar Item
-  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.text = "$(unmute) AudioWizard";
-  statusBar.tooltip = "Click to Toggle Audio Play/Pause (Ctrl+Alt+Space)";
-  statusBar.command = "audiowizard.togglePlayPause";
-  statusBar.show();
-  context.subscriptions.push(statusBar);
-  player.setStatusBarItem(statusBar);
-
-  // 1. Read Active Document
-  const readDocCmd = vscode.commands.registerCommand('audiowizard.readDocument', () => {
+  const readDocument = (mode?: ReadMode) => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       vscode.window.showInformationMessage('AudioWizard: Open a file first.');
       return;
     }
-    const doc = editor.document;
-    const text = doc.getText();
-    const fileName = doc.fileName.split(/[\\/]/).pop() || 'Document';
-    player.playText(text, fileName);
-  });
+    const { document, selection } = editor;
+    // From the cursor to the end, unless the cursor is at the very top
+    const start = selection.isEmpty && selection.active.line > 0 ? document.lineAt(selection.active.line).range.start : undefined;
+    const text = start ? document.getText(new vscode.Range(start, document.lineAt(document.lineCount - 1).range.end)) : document.getText();
+    const title = start ? `${fileName(document)} · from line ${start.line + 1}` : fileName(document);
+    void player.play(text, title, 'document', mode);
+  };
 
-  // 2. Read Selected Text
-  const readSelCmd = vscode.commands.registerCommand('audiowizard.readSelection', () => {
+  const readSelection = (): boolean => {
     const editor = vscode.window.activeTextEditor;
-    if (!editor || editor.selection.isEmpty) {
-      vscode.window.showInformationMessage('AudioWizard: Highlight some text first to read.');
-      return;
-    }
-    const text = editor.document.getText(editor.selection);
-    const fileName = editor.document.fileName.split(/[\\/]/).pop() || 'Selection';
-    player.playText(text, `${fileName} (Selection)`);
-  });
+    if (!editor || editor.selection.isEmpty) return false;
+    void player.play(editor.document.getText(editor.selection), `${fileName(editor.document)} · selection`, 'selection');
+    return true;
+  };
 
-  // 3. Read Clipboard (e.g. Agent Response)
-  const readClipCmd = vscode.commands.registerCommand('audiowizard.readClipboard', async () => {
+  const readClipboard = async (copyFirst: boolean) => {
+    if (copyFirst) await copyFocusedSelection();
     const text = await vscode.env.clipboard.readText();
-    if (!text || !text.trim()) {
-      vscode.window.showInformationMessage('AudioWizard: Clipboard is empty. Copy text from chat first.');
+    if (!text.trim()) {
+      vscode.window.showInformationMessage(
+        'AudioWizard: Nothing to read. Select text (or click Copy on an agent reply), then press Ctrl+Alt+C.'
+      );
       return;
     }
-    player.playText(text, 'Agent Response / Clipboard');
-  });
+    void player.play(text, 'Clipboard', 'clipboard');
+  };
 
-  // 4. Toggle Play/Pause
-  const toggleCmd = vscode.commands.registerCommand('audiowizard.togglePlayPause', () => {
-    player.togglePlayPause();
-  });
-
-  // 5. Stop Audio
-  const stopCmd = vscode.commands.registerCommand('audiowizard.stop', () => {
-    player.stop();
-  });
-
-  context.subscriptions.push(readDocCmd, readSelCmd, readClipCmd, toggleCmd, stopCmd);
+  context.subscriptions.push(
+    vscode.commands.registerCommand('audiowizard.readDocument', () => readDocument()),
+    vscode.commands.registerCommand('audiowizard.skimDocument', () => readDocument('skim')),
+    vscode.commands.registerCommand('audiowizard.readSelection', () => {
+      if (!readSelection()) vscode.window.showInformationMessage('AudioWizard: Highlight some text first.');
+    }),
+    vscode.commands.registerCommand('audiowizard.readClipboard', () => readClipboard(false)),
+    // Ctrl+Alt+C: editor selection, else whatever is selected in the focused panel, else the clipboard
+    vscode.commands.registerCommand('audiowizard.read', async (args?: { copyFirst?: boolean }) => {
+      // copyFirst is set by the keybinding when focus is outside the text editor
+      const copyFirst = args?.copyFirst === true;
+      if (!copyFirst && readSelection()) return;
+      await readClipboard(copyFirst);
+    }),
+    vscode.commands.registerCommand('audiowizard.togglePlayPause', () => player.togglePlayPause()),
+    vscode.commands.registerCommand('audiowizard.stop', () => player.stop())
+  );
 }
 
 export function deactivate() {
-  // Cleanup
+  // The player is disposed through context.subscriptions, which stops any audio
 }

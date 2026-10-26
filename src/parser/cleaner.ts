@@ -2,52 +2,73 @@ export interface CleanOptions {
   skipCodeBlocks?: boolean;
 }
 
+const FRONTMATTER = /^﻿?---\n[\s\S]*?\n---[ \t]*(\n|$)/;
+const CODE_FENCE = /^[ \t]*(```|~~~)[^\n]*\n([\s\S]*?)^[ \t]*\1[ \t]*$/gm;
+
+export function normalizeNewlines(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
+export function stripFrontmatter(text: string): string {
+  return text.replace(FRONTMATTER, "");
+}
+
+function countLines(code: string): number {
+  const trimmed = code.replace(/\n+$/, "");
+  return trimmed ? trimmed.split("\n").length : 0;
+}
+
 export function cleanTextForSpeech(text: string, options: CleanOptions = { skipCodeBlocks: true }): string {
   if (!text) return "";
 
-  let cleaned = text;
+  let cleaned = stripFrontmatter(normalizeNewlines(text));
 
-  // 1. Strip YAML frontmatter (--- ... ---)
-  cleaned = cleaned.replace(/^---[\s\S]*?---\s*/m, "");
+  // Fenced code blocks: announce and skip, or keep the code itself
+  cleaned = cleaned.replace(CODE_FENCE, (_match, _fence, code: string) => {
+    if (options.skipCodeBlocks === false) return code;
+    const lines = countLines(code);
+    return `\nCode block, ${lines} ${lines === 1 ? "line" : "lines"}, skipped.\n`;
+  });
 
-  // 2. Handle Markdown Code Blocks (``` ... ```)
-  if (options.skipCodeBlocks) {
-    cleaned = cleaned.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, (_match, codeContent) => {
-      const lineCount = (codeContent.match(/\n/g) || []).length + 1;
-      return ` [Code block with ${lineCount} lines omitted.] `;
-    });
-  } else {
-    cleaned = cleaned.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, "$1");
-  }
+  // HTML comments and tags (<br>, <details>, <img ...>)
+  cleaned = cleaned.replace(/<!--[\s\S]*?-->/g, "");
+  cleaned = cleaned.replace(/<\/?[a-zA-Z][^>\n]*>/g, " ");
 
-  // 3. Strip inline code backticks `code` -> code
-  cleaned = cleaned.replace(/`([^`]+)`/g, "$1");
+  // Inline code `code` -> code
+  cleaned = cleaned.replace(/`([^`\n]+)`/g, "$1");
 
-  // 4. Strip markdown image tags ![alt](url)
-  cleaned = cleaned.replace(/!\[([^\]]*)\]\([^)]+\)/g, "");
+  // Images are dropped, links keep their text
+  cleaned = cleaned.replace(/!\[([^\]]*)\]\([^)]*\)/g, "");
+  cleaned = cleaned.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
 
-  // 5. Convert markdown links [text](url) -> text
-  cleaned = cleaned.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  // Bare URLs are read as "link to example.com" instead of letter by letter
+  cleaned = cleaned.replace(/\bhttps?:\/\/(?:www\.)?([^\/\s)]+)[^\s)]*/g, "link to $1");
 
-  // 6. Strip Markdown Headings (# Header -> Header)
-  cleaned = cleaned.replace(/^#{1,6}\s+/gm, "");
+  // Headings, blockquotes, horizontal rules
+  cleaned = cleaned.replace(/^#{1,6}[ \t]+(.*?)[ \t#]*$/gm, "$1");
+  cleaned = cleaned.replace(/^[ \t]*>[ \t]?/gm, "");
+  cleaned = cleaned.replace(/^[ \t]*([-*_])([ \t]*\1){2,}[ \t]*$/gm, "");
 
-  // 7. Strip bold, italics, strikethrough (***, **, *, ~~)
-  cleaned = cleaned.replace(/[*_~]{1,3}([^*_~]+)[*_~]{1,3}/g, "$1");
+  // Emphasis. Underscores only count at word edges so snake_case survives.
+  cleaned = cleaned.replace(/\*\*\*([^*\n]+)\*\*\*/g, "$1");
+  cleaned = cleaned.replace(/\*\*([^*\n]+)\*\*/g, "$1");
+  cleaned = cleaned.replace(/(?<![\w*])\*([^*\n]+)\*(?![\w*])/g, "$1");
+  cleaned = cleaned.replace(/(?<!\w)__([^_\n]+)__(?!\w)/g, "$1");
+  cleaned = cleaned.replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, "$1");
+  cleaned = cleaned.replace(/~~([^~\n]+)~~/g, "$1");
 
-  // 8. Strip blockquotes (> Quote -> Quote)
-  cleaned = cleaned.replace(/^>\s+/gm, "");
+  // Tables: drop separator rows, turn cells into a comma list
+  cleaned = cleaned.replace(/^[ \t]*\|?[ \t:-]+\|[ \t:|-]*(\n|$)/gm, "");
+  cleaned = cleaned.replace(/^[ \t]*\|(.*?)\|?[ \t]*$/gm, (_m, row: string) =>
+    row.split("|").map((c) => c.trim()).filter(Boolean).join(", ")
+  );
+  cleaned = cleaned.replace(/[ \t]*\|[ \t]*/g, ", ");
 
-  // 9. Strip markdown table separator lines (| --- | --- |)
-  cleaned = cleaned.replace(/^\|?[\s-:]+\|[\s-:|]+$/gm, "");
-  // Clean markdown table cells (| Cell | Cell | -> Cell, Cell)
-  cleaned = cleaned.replace(/\|\s*/g, " ");
+  // List markers and task checkboxes
+  cleaned = cleaned.replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?/gm, "");
 
-  // 10. Normalize bullet points and numbered lists
-  cleaned = cleaned.replace(/^[\s]*[-*+]\s+/gm, "");
-  cleaned = cleaned.replace(/^[\s]*\d+\.\s+/gm, "");
-
-  // 11. Normalize excess whitespace
+  cleaned = cleaned.replace(/[ \t]+/g, " ");
+  cleaned = cleaned.replace(/^ +| +$/gm, "");
   cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
 
   return cleaned;

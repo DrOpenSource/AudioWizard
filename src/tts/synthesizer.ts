@@ -1,55 +1,71 @@
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
+import { escapeForSsml } from '../parser/chunker';
 
-export interface TTSChunk {
-  text: string;
-  audioBase64: string;
+export class SynthesisCancelled extends Error {
+  constructor() {
+    super('Synthesis cancelled');
+  }
 }
 
+/**
+ * Edge neural TTS over a single connection. Requests run one at a time so
+ * voice changes never race, and cancelled requests are skipped before they start.
+ */
 export class TTSSynthesizer {
-  private tts: MsEdgeTTS;
-  private currentVoice: string = 'en-US-JennyNeural';
+  private tts: MsEdgeTTS | null = null;
+  private voice = '';
+  private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(voice: string = 'en-US-JennyNeural') {
-    this.tts = new MsEdgeTTS();
-    this.currentVoice = voice;
+  public synthesize(text: string, voice: string, signal: AbortSignal): Promise<string> {
+    const job = this.queue.then(() => this.run(text, voice, signal));
+    this.queue = job.catch(() => undefined);
+    return job;
   }
 
-  public async setVoice(voice: string) {
-    this.currentVoice = voice;
+  private async run(text: string, voice: string, signal: AbortSignal): Promise<string> {
+    try {
+      return await this.attempt(text, voice, signal);
+    } catch (err) {
+      if (err instanceof SynthesisCancelled) throw err;
+      // Reconnects occasionally time out; one fresh connection usually succeeds
+      return this.attempt(text, voice, signal);
+    }
   }
 
-  public splitIntoChunks(text: string, maxLen: number = 400): string[] {
-    const rawSentences = text.split(/(?<=[.?!;:\n])\s+/);
-    const chunks: string[] = [];
-    let current = '';
-
-    for (const s of rawSentences) {
-      if ((current + ' ' + s).trim().length > maxLen && current.trim().length > 0) {
-        chunks.push(current.trim());
-        current = s;
-      } else {
-        current = (current + ' ' + s).trim();
+  private async attempt(text: string, voice: string, signal: AbortSignal): Promise<string> {
+    if (signal.aborted) throw new SynthesisCancelled();
+    try {
+      if (!this.tts) {
+        this.tts = new MsEdgeTTS({ connectionTimeoutMs: 8000, synthesisTimeoutMs: 15000 });
+        this.voice = '';
       }
+      if (this.voice !== voice) {
+        await this.tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+        this.voice = voice;
+      }
+      const { audioStream } = this.tts.toStream(escapeForSsml(text));
+      const audio = await new Promise<Buffer>((resolve, reject) => {
+        const parts: Buffer[] = [];
+        audioStream.on('data', (part: Buffer) => parts.push(part));
+        audioStream.on('end', () => resolve(Buffer.concat(parts)));
+        audioStream.on('error', reject);
+      });
+      if (!audio.length) throw new Error('Edge TTS returned no audio');
+      return `data:audio/mp3;base64,${audio.toString('base64')}`;
+    } catch (err) {
+      // Drop the connection so the next request starts from a clean socket
+      this.dispose();
+      throw err;
     }
-    if (current.trim().length > 0) {
-      chunks.push(current.trim());
-    }
-    return chunks;
   }
 
-  public async synthesizeText(text: string, voice?: string): Promise<string> {
-    const targetVoice = voice || this.currentVoice;
-    await this.tts.setMetadata(targetVoice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    const { audioStream } = this.tts.toStream(text);
-
-    return new Promise((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      audioStream.on('data', (chunk: Buffer) => chunks.push(chunk));
-      audioStream.on('end', () => {
-        const fullBuffer = Buffer.concat(chunks);
-        resolve(`data:audio/mp3;base64,${fullBuffer.toString('base64')}`);
-      });
-      audioStream.on('error', (err: any) => reject(err));
-    });
+  public dispose(): void {
+    try {
+      this.tts?.close();
+    } catch {
+      // Already closed
+    }
+    this.tts = null;
+    this.voice = '';
   }
 }
